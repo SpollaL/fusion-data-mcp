@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fusion-data-mcp"
+version = "0.1.0"
+description = "MCP server for nuclear fusion experimental databases (LHD, MAST, Alcator C-Mod)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+keywords = ["mcp", "fusion", "plasma", "physics", "MDSplus", "MAST", "LHD"]
+dependencies = [
+    "mcp>=1.0.0",
+    "pydantic>=2.0",
+    "httpx>=0.27",
+    "boto3>=1.34",
+    "s3fs>=2024.1",
+    "fsspec>=2024.1",
+    "xarray>=2024.1",
+    "zarr>=3.0",
+    "h5py>=3.10",
+    "h5netcdf>=1.3",
+    "numpy>=1.26",
+    "pandas>=2.0",
+    "mdsthin>=1.0",
+    "anyio>=4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "respx",
+    "moto[s3]",
+    "ruff",
+    "mypy",
+]
+
+[project.scripts]
+fusion-data-mcp = "fusion_data_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fusion_data_mcp"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
