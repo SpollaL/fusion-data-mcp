@@ -15,7 +15,7 @@ class Signal(BaseModel):
     native_name: str
     units: str | None = None
     time_s: list[float]
-    data: list[float] | list[list[float]]
+    data: list[float | None] | list[list[float | None]]
     shape: list[int]
     sample_rate_hz: float | None = None
     downsampled: bool = False
