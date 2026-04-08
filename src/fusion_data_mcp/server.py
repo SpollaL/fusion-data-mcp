@@ -27,6 +27,7 @@ from typing import Any
 
 from mcp.server import Server
 from mcp.server.models import InitializationOptions
+from mcp.server.lowlevel.server import NotificationOptions
 import mcp.server.stdio
 import mcp.types as types
 
@@ -385,7 +386,7 @@ async def _run() -> None:
                 server_name="fusion-data-mcp",
                 server_version="0.1.0",
                 capabilities=server.get_capabilities(
-                    notification_options=None,
+                    notification_options=NotificationOptions(),
                     experimental_capabilities={},
                 ),
             ),
