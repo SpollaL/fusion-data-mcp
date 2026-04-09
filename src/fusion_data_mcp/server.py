@@ -284,7 +284,7 @@ async def _dispatch(name: str, args: dict[str, Any]) -> dict:
 # ---------------------------------------------------------------------------
 
 async def _list_devices() -> dict:
-    devices = [c.device_info.model_dump() for c in registry.list_all()]
+    devices = [c.device_info.model_dump(mode="json") for c in registry.list_all()]
     return {"devices": devices, "total": len(devices)}
 
 
@@ -308,14 +308,14 @@ async def _search_shots(args: dict) -> dict:
         offset=args.get("offset", 0),
     )
     shots = await connector.search_shots(params)
-    return {"shots": [s.model_dump() for s in shots], "total": len(shots)}
+    return {"shots": [s.model_dump(mode="json") for s in shots], "total": len(shots)}
 
 
 async def _get_shot_metadata(args: dict) -> dict:
     shot_id = args["shot_id"]
     connector = registry.get_for_shot(shot_id)
     meta = await connector.get_shot_metadata(shot_id)
-    return meta.model_dump()
+    return meta.model_dump(mode="json")
 
 
 async def _list_diagnostics(args: dict) -> dict:
@@ -323,7 +323,7 @@ async def _list_diagnostics(args: dict) -> dict:
     shot_id = args.get("shot_id")
     connector = registry.get(device_id)
     result = await connector.list_diagnostics(shot_id)
-    return result.model_dump()
+    return result.model_dump(mode="json")
 
 
 async def _describe_signal(args: dict) -> dict:
@@ -331,7 +331,7 @@ async def _describe_signal(args: dict) -> dict:
     diagnostic = args["diagnostic"]
     connector = registry.get_for_shot(shot_id)
     summary = await connector.describe_signal(shot_id, diagnostic)
-    return summary.model_dump()
+    return summary.model_dump(mode="json")
 
 
 async def _get_signal(args: dict) -> dict:
@@ -345,7 +345,7 @@ async def _get_signal(args: dict) -> dict:
         t_end=args.get("t_end"),
         max_samples=args.get("max_samples", config.default_max_samples),
     )
-    return signal.model_dump()
+    return signal.model_dump(mode="json")
 
 
 async def _get_equilibrium(args: dict) -> dict:
@@ -357,7 +357,7 @@ async def _get_equilibrium(args: dict) -> dict:
             ErrorCode.SIGNAL_NOT_FOUND,
             f"Equilibrium data not available for shot {shot_id}",
         )
-    return eq.model_dump()
+    return eq.model_dump(mode="json")
 
 
 # ---------------------------------------------------------------------------

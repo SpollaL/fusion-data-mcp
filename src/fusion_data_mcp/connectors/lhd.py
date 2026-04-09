@@ -3,19 +3,36 @@ LHD connector — NIFS Large Helical Device data on AWS S3.
 
 Public bucket: s3://nifs-lhd  (region: ap-northeast-1)
 Access:        Anonymous (no credentials required)
-Coverage:      ~25 years of experiments (1998–present), ~2 PB
+Coverage:      ~25 years of experiments (1998–present)
 License:       NIFS Rights and Terms (open research use)
 
-Files are HDF5/NetCDF accessed via s3fs + xarray.
-Bucket layout is discovered at init time.
+Actual bucket layout (confirmed):
+  s3://nifs-lhd/
+    {year}_{Nth}/                   e.g. "2025-26th"
+      {DiagName}/                   e.g. "Bolometer", "FIR1"
+        {start}-{end}/              e.g. "948600-948699"
+          {DiagName}-{shot}-1.zip   per-shot data archive
+
+Each zip contains:
+  {DiagName}-{shot}-1.shot         text key=value shot metadata
+  {DiagName}-{shot}-1/
+    {DiagName}-{shot}-1-{ch}.prm   text key=value channel metadata
+    {DiagName}-{shot}-1-{ch}.dat   raw ADC binary (ZLIB-compressed INT16)
+
+Data is raw ADC output. Physical-unit calibration is diagnostic-specific
+and is not applied here — returned values are in ADC counts (INT16).
+Time axis is seconds from the hardware trigger (0-based).
 """
 
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
-from datetime import datetime
-from typing import Literal
+import struct
+import zipfile
+import zlib
+from typing import Iterator
 
 import numpy as np
 
@@ -40,27 +57,31 @@ _BUCKET = "nifs-lhd"
 _REGION = "ap-northeast-1"
 _LICENSE = "NIFS Rights and Terms — https://www-lhd.nifs.ac.jp/pub/RightsTerms.html"
 
-BucketLayout = Literal["partitioned", "flat", "manifest", "unknown"]
-
-# Known canonical → LHD native group/variable mappings (best-effort).
-# These will be refined once the actual bucket layout is confirmed.
-_SIGNAL_MAP: dict[str, tuple[str, str]] = {
-    "plasma_current":       ("magnetics", "ip"),
-    "loop_voltage":         ("magnetics", "vloop"),
-    "stored_energy":        ("mhd", "wmhd"),
-    "electron_density":     ("thomson", "ne"),
-    "electron_temperature": ("thomson", "te"),
-    "neutral_beam_power":   ("heating", "pnbi"),
-    "radiated_power":       ("bolometer", "prad"),
+# Canonical name → (diagnostic directory, channel number)
+# Confirmed against 2025-26th campaign.
+# Note: electron_temperature is not mapped — FastThomson is raw CCD counts
+# (requires spectral fitting) and dcece is ~1.8 GB per shot (impractical).
+_SIGNAL_MAP: dict[str, tuple[str, int]] = {
+    "radiated_power":   ("Bolometer",   1),
+    "electron_density": ("FIR1",        1),
+    "neutral_beam_power": ("NB1arm",    1),
+    "plasma_current":   ("Magnetics_A", 1),
 }
+
+# Diagnostic used to enumerate available shots (reliable presence across campaigns)
+_INDEX_DIAG = "Bolometer"
 
 
 class LHDConnector(AbstractConnector):
-    """LHD connector via anonymous S3 access + HDF5/NetCDF."""
+    """LHD connector via anonymous S3 access + NIFS Labcom zip archives."""
 
     def __init__(self) -> None:
         self._fs = None
-        self._layout: BucketLayout = "unknown"
+        self._campaigns: list[str] | None = None  # sorted newest-first
+
+    # ------------------------------------------------------------------ #
+    # Internal helpers                                                     #
+    # ------------------------------------------------------------------ #
 
     def _get_fs(self):
         if self._fs is None:
@@ -71,43 +92,98 @@ class LHDConnector(AbstractConnector):
                     "s3fs is required for the LHD connector. "
                     "Install it with: pip install s3fs"
                 )
-            self._fs = s3fs.S3FileSystem(anon=True, client_kwargs={"region_name": _REGION})
+            self._fs = s3fs.S3FileSystem(
+                anon=True, client_kwargs={"region_name": _REGION}
+            )
         return self._fs
 
-    async def _discover_layout(self) -> BucketLayout:
-        """Probe the bucket top-level structure to infer layout convention."""
-        if self._layout != "unknown":
-            return self._layout
+    def _list_campaigns(self, fs) -> list[str]:
+        """Return campaign directory names sorted newest-first."""
+        top = fs.ls(f"s3://{_BUCKET}/", detail=False)
+        campaigns = []
+        for p in top:
+            name = p.rstrip("/").split("/")[-1]
+            # Campaign dirs start with a 4-digit year, e.g. "2025-26th"
+            if len(name) >= 4 and name[:4].isdigit():
+                campaigns.append(name)
+        # Sort by leading year, then by trailing number
+        def _sort_key(c):
+            parts = c.replace("-", "_").split("_")
+            return int(parts[0]) if parts[0].isdigit() else 0
+        campaigns.sort(key=_sort_key, reverse=True)
+        return campaigns
 
-        def _probe(fs):
+    async def _get_campaigns(self) -> list[str]:
+        if self._campaigns is None:
+            fs = self._get_fs()
+            self._campaigns = await asyncio.to_thread(self._list_campaigns, fs)
+        return self._campaigns
+
+    def _shot_range_dir(self, shot_no: int) -> str:
+        """Return the range directory name that contains shot_no."""
+        base = (shot_no // 100) * 100
+        return f"{base:06d}-{base + 99:06d}"
+
+    def _zip_path(self, campaign: str, diag: str, shot_no: int, sub: int = 1) -> str:
+        range_dir = self._shot_range_dir(shot_no)
+        return f"s3://{_BUCKET}/{campaign}/{diag}/{range_dir}/{diag}-{shot_no}-{sub}.zip"
+
+    def _find_campaign_for_shot(self, fs, campaigns: list[str], shot_no: int) -> str | None:
+        """Find which campaign contains shot_no by checking the index diagnostic."""
+        for campaign in campaigns:
+            range_dir = self._shot_range_dir(shot_no)
+            path = f"s3://{_BUCKET}/{campaign}/{_INDEX_DIAG}/{range_dir}/"
             try:
-                top = fs.ls(f"s3://{_BUCKET}/", detail=False)
-                if not top:
-                    return "unknown"
-                # Check for a manifest/index file
-                manifest_candidates = [p for p in top if "index" in p.lower() or "manifest" in p.lower()]
-                if manifest_candidates:
-                    return "manifest"
-                # Check if top-level entries look like date partitions (YYYY or YYYYMM)
-                names = [p.rstrip("/").split("/")[-1] for p in top[:10]]
-                if all(n.isdigit() and len(n) in (4, 6, 8) for n in names if n):
-                    return "partitioned"
-                return "flat"
-            except Exception as e:
-                logger.warning("LHD bucket probe failed: %s", e)
-                return "unknown"
+                files = fs.ls(path, detail=False)
+                for f in files:
+                    fname = f.split("/")[-1]
+                    # filename: {Diag}-{shot}-{sub}.zip
+                    parts = fname.replace(".zip", "").split("-")
+                    if len(parts) >= 2 and parts[-2].isdigit():
+                        if int(parts[-2]) == shot_no:
+                            return campaign
+            except Exception:
+                continue
+        return None
 
-        layout = await asyncio.to_thread(_probe, self._get_fs())
-        self._layout = layout
-        logger.info("LHD bucket layout detected: %s", layout)
-        return layout
+    def _list_shots_in_campaign(
+        self, fs, campaign: str, diag: str, limit: int, offset: int
+    ) -> list[int]:
+        """Return shot numbers from a campaign's diagnostic directory."""
+        try:
+            ranges = sorted(
+                fs.ls(f"s3://{_BUCKET}/{campaign}/{diag}/", detail=False),
+                reverse=True,
+            )
+        except Exception:
+            return []
 
-    def _shot_path(self, native_id: str) -> str:
-        """Construct the S3 path for a given shot ID."""
-        # Partitioned layout assumption: shots/YYYY/YYYYMMDD/SHOTID.h5
-        # This will need adjustment based on actual bucket structure.
-        year = native_id[:4] if len(native_id) >= 4 else native_id
-        return f"s3://{_BUCKET}/shots/{year}/{native_id}.h5"
+        shots: list[int] = []
+        skipped = 0
+        for range_path in ranges:
+            try:
+                files = fs.ls(range_path, detail=False)
+            except Exception:
+                continue
+            # Parse shot numbers from filenames: {Diag}-{shot}-{sub}.zip
+            for fpath in sorted(files, reverse=True):
+                fname = fpath.split("/")[-1]
+                if not fname.endswith(".zip"):
+                    continue
+                parts = fname.replace(".zip", "").split("-")
+                if len(parts) < 2:
+                    continue
+                try:
+                    shot_no = int(parts[-2])
+                except ValueError:
+                    continue
+                if skipped < offset:
+                    skipped += 1
+                    continue
+                shots.append(shot_no)
+                if len(shots) >= limit:
+                    return shots
+        return shots
 
     # ------------------------------------------------------------------ #
     # DeviceInfo                                                           #
@@ -129,10 +205,9 @@ class LHDConnector(AbstractConnector):
                 "~2 PB of experimental data (1998–present) publicly available on AWS S3."
             ),
             capabilities=DeviceCapabilities(
-                has_equilibrium=True,
-                searchable_by_date=True,
+                has_equilibrium=False,
+                searchable_by_date=False,
                 searchable_by_plasma_params=False,
-                max_signal_duration_s=10.0,
             ),
             data_license=_LICENSE,
             data_url=f"s3://{_BUCKET}",
@@ -143,118 +218,88 @@ class LHDConnector(AbstractConnector):
     # ------------------------------------------------------------------ #
 
     async def search_shots(self, params: ShotSearchParams) -> list[Shot]:
-        await self._discover_layout()
+        campaigns = await self._get_campaigns()
         fs = self._get_fs()
 
-        def _list(fs, date_from, date_to, limit, offset):
-            shots = []
-            try:
-                if self._layout == "partitioned":
-                    # List year prefixes within date range
-                    year_from = date_from.year if date_from else 1998
-                    year_to = date_to.year if date_to else datetime.now().year
-                    for year in range(year_from, year_to + 1):
-                        prefix = f"s3://{_BUCKET}/shots/{year}/"
-                        try:
-                            paths = fs.ls(prefix, detail=False)
-                            for p in paths[offset : offset + limit - len(shots)]:
-                                native_id = p.rstrip("/").split("/")[-1].replace(".h5", "")
-                                shots.append(native_id)
-                                if len(shots) >= limit:
-                                    return shots
-                        except Exception:
-                            continue
-                else:
-                    # Flat layout: list top-level files
-                    paths = fs.ls(f"s3://{_BUCKET}/", detail=False)
-                    for p in paths[offset : offset + limit]:
-                        native_id = p.rstrip("/").split("/")[-1].replace(".h5", "")
-                        shots.append(native_id)
-            except Exception as e:
-                logger.error("LHD shot listing failed: %s", e)
-            return shots
+        shots: list[Shot] = []
+        remaining = params.limit
+        offset = params.offset
 
-        native_ids = await asyncio.to_thread(
-            _list, fs, params.date_from, params.date_to, params.limit, params.offset
-        )
-        return [
-            Shot(
-                shot_id=self.make_shot_id(nid),
-                device_id=self.device_id,
-                native_shot_id=nid,
-                status="unknown",
+        for campaign in campaigns:
+            if remaining <= 0:
+                break
+            native_ids = await asyncio.to_thread(
+                self._list_shots_in_campaign, fs, campaign, _INDEX_DIAG,
+                remaining, offset if not shots else 0,
             )
-            for nid in native_ids
-        ]
+            offset = max(0, offset - 100)  # rough offset carry-over
+            for shot_no in native_ids:
+                shots.append(Shot(
+                    shot_id=self.make_shot_id(str(shot_no)),
+                    device_id=self.device_id,
+                    native_shot_id=str(shot_no),
+                    status="unknown",
+                ))
+            remaining -= len(native_ids)
+
+        return shots[: params.limit]
 
     async def get_shot_metadata(self, shot_id: str) -> ShotMetadata:
         native_id = self.parse_native_id(shot_id)
-        path = self._shot_path(native_id)
+        shot_no = int(native_id)
+        campaigns = await self._get_campaigns()
         fs = self._get_fs()
 
-        def _read_attrs(fs, p):
-            try:
-                import h5py
-                with fs.open(p, "rb") as f:
-                    with h5py.File(f, "r") as h:
-                        attrs = dict(h.attrs)
-                        groups = list(h.keys())
-                return attrs, groups
-            except Exception as e:
-                logger.warning("LHD metadata read failed for %s: %s", p, e)
-                return {}, []
+        campaign = await asyncio.to_thread(
+            self._find_campaign_for_shot, fs, campaigns, shot_no
+        )
 
-        attrs, groups = await asyncio.to_thread(_read_attrs, fs, path)
+        additional: dict = {"campaign": campaign} if campaign else {}
+
+        if campaign:
+            zip_path = self._zip_path(campaign, _INDEX_DIAG, shot_no)
+            try:
+                meta = await asyncio.to_thread(self._read_shot_meta, fs, zip_path)
+                additional.update(meta)
+            except Exception as e:
+                logger.warning("LHD metadata read failed for %s: %s", shot_id, e)
+
         return ShotMetadata(
             shot_id=self.make_shot_id(native_id),
             device_id=self.device_id,
             native_shot_id=native_id,
-            additional_fields=to_json_safe({**attrs, "groups": groups}),
-            diagnostic_count=len(groups),
+            additional_fields=to_json_safe(additional),
+            diagnostic_count=len(_SIGNAL_MAP),
             license=_LICENSE,
         )
 
+    def _read_shot_meta(self, fs, zip_path: str) -> dict:
+        with fs.open(zip_path, "rb") as f:
+            data = f.read()
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            shot_files = [n for n in z.namelist() if n.endswith(".shot")]
+            if not shot_files:
+                return {}
+            raw = z.read(shot_files[0]).decode("utf-8", errors="replace")
+        result = {}
+        for line in raw.splitlines():
+            parts = line.strip().split(",")
+            if len(parts) >= 3:
+                result[parts[1]] = parts[2]
+        return result
+
     async def list_diagnostics(self, shot_id: str | None = None) -> DiagnosticList:
-        if shot_id is not None:
-            native_id = self.parse_native_id(shot_id)
-            path = self._shot_path(native_id)
-            fs = self._get_fs()
-
-            def _list_groups(fs, p):
-                try:
-                    import h5py
-                    with fs.open(p, "rb") as f:
-                        with h5py.File(f, "r") as h:
-                            return list(h.keys())
-                except Exception:
-                    return []
-
-            groups = await asyncio.to_thread(_list_groups, fs, path)
-            diagnostics = [
-                Diagnostic(
-                    name=g,
-                    native_name=g,
-                    canonical_name=next(
-                        (k for k, (grp, _) in _SIGNAL_MAP.items() if grp == g), None
-                    ),
-                    category=g,
-                    signal_type="unknown",
-                )
-                for g in groups
-            ]
-        else:
-            # Return known canonical diagnostics
-            diagnostics = [
-                Diagnostic(
-                    name=canon,
-                    native_name=f"{grp}/{var}",
-                    canonical_name=canon,
-                    category=grp,
-                    signal_type="scalar",
-                )
-                for canon, (grp, var) in _SIGNAL_MAP.items()
-            ]
-
+        diagnostics = [
+            Diagnostic(
+                name=canon,
+                native_name=f"{diag}/ch{ch}",
+                canonical_name=canon,
+                category=diag,
+                signal_type="scalar",
+                description="Raw ADC counts (INT16). Physical calibration not applied.",
+            )
+            for canon, (diag, ch) in _SIGNAL_MAP.items()
+        ]
         return DiagnosticList(
             device_id=self.device_id,
             shot_id=shot_id,
@@ -266,39 +311,41 @@ class LHDConnector(AbstractConnector):
     # Data retrieval                                                       #
     # ------------------------------------------------------------------ #
 
-    def _resolve_signal(self, diagnostic: str) -> tuple[str, str]:
+    def _resolve_signal(self, diagnostic: str) -> tuple[str, int]:
         if diagnostic in _SIGNAL_MAP:
             return _SIGNAL_MAP[diagnostic]
+        # Allow native "DiagName/chN" or just "DiagName"
         if "/" in diagnostic:
-            parts = diagnostic.split("/", 1)
-            return parts[0], parts[1]
-        raise KeyError(f"Unknown diagnostic '{diagnostic}' for LHD")
+            diag, ch_str = diagnostic.split("/", 1)
+            ch = int(ch_str.replace("ch", "")) if ch_str.replace("ch", "").isdigit() else 1
+            return diag, ch
+        return diagnostic, 1
 
     async def _load_signal_arrays(
-        self, native_id: str, group: str, variable: str
+        self, shot_id: str, diagnostic: str
     ) -> tuple[np.ndarray, np.ndarray]:
-        path = self._shot_path(native_id)
+        native_id = self.parse_native_id(shot_id)
+        shot_no = int(native_id)
+        diag, ch = self._resolve_signal(diagnostic)
+
+        campaigns = await self._get_campaigns()
         fs = self._get_fs()
 
-        def _read(fs, p, grp, var):
-            import h5py
-            with fs.open(p, "rb") as f:
-                with h5py.File(f, "r") as h:
-                    ds = h[grp][var]
-                    data = ds[:]
-                    # Time dimension: look for 'time' or 't' coordinate
-                    time = None
-                    for tname in ("time", "t", "TIME"):
-                        if tname in h[grp]:
-                            time = h[grp][tname][:]
-                            break
-                    if time is None and "time" in ds.dims:
-                        time = ds.dims[0][:]
-                    if time is None:
-                        time = np.arange(len(data), dtype=float)
-                    return np.asarray(time, dtype=float), np.asarray(data, dtype=float)
+        campaign = await asyncio.to_thread(
+            self._find_campaign_for_shot, fs, campaigns, shot_no
+        )
+        if campaign is None:
+            raise KeyError(f"Shot {shot_no} not found in any LHD campaign")
 
-        return await asyncio.to_thread(_read, fs, path, group, variable)
+        zip_path = self._zip_path(campaign, diag, shot_no)
+
+        def _read(fs, path, ch):
+            with fs.open(path, "rb") as f:
+                raw = f.read()
+            with zipfile.ZipFile(io.BytesIO(raw)) as z:
+                return _parse_channel(z, ch)
+
+        return await asyncio.to_thread(_read, fs, zip_path, ch)
 
     async def get_signal(
         self,
@@ -309,9 +356,8 @@ class LHDConnector(AbstractConnector):
         t_end: float | None = None,
         max_samples: int = 10_000,
     ) -> Signal:
-        native_id = self.parse_native_id(shot_id)
-        group, variable = self._resolve_signal(diagnostic)
-        time_arr, data_arr = await self._load_signal_arrays(native_id, group, variable)
+        diag, ch = self._resolve_signal(diagnostic)
+        time_arr, data_arr = await self._load_signal_arrays(shot_id, diagnostic)
 
         if t_start is not None:
             mask = time_arr >= t_start
@@ -321,61 +367,28 @@ class LHDConnector(AbstractConnector):
             time_arr, data_arr = time_arr[mask], data_arr[mask]
 
         return signal_from_arrays(
-            shot_id=self.make_shot_id(native_id),
+            shot_id=shot_id,
             diagnostic=diagnostic,
-            native_name=f"{group}/{variable}",
+            native_name=f"{diag}/ch{ch}",
             time_arr=time_arr,
             data_arr=data_arr,
             max_samples=max_samples,
         )
 
     async def describe_signal(self, shot_id: str, diagnostic: str) -> SignalSummary:
-        native_id = self.parse_native_id(shot_id)
-        group, variable = self._resolve_signal(diagnostic)
-        time_arr, data_arr = await self._load_signal_arrays(native_id, group, variable)
+        diag, ch = self._resolve_signal(diagnostic)
+        time_arr, data_arr = await self._load_signal_arrays(shot_id, diagnostic)
         return summary_from_arrays(
-            shot_id=self.make_shot_id(native_id),
+            shot_id=shot_id,
             diagnostic=diagnostic,
-            native_name=f"{group}/{variable}",
+            native_name=f"{diag}/ch{ch}",
             time_arr=time_arr,
             data_arr=data_arr,
         )
 
     async def get_equilibrium(self, shot_id: str) -> EquilibriumData | None:
-        native_id = self.parse_native_id(shot_id)
-        # LHD uses VMEC for equilibrium reconstruction
-        path = self._shot_path(native_id)
-        fs = self._get_fs()
-
-        def _read_vmec(fs, p):
-            import h5py
-            with fs.open(p, "rb") as f:
-                with h5py.File(f, "r") as h:
-                    if "vmec" not in h and "VMEC" not in h:
-                        return None
-                    grp = h.get("vmec") or h.get("VMEC")
-                    psi = grp["psi_norm"][:] if "psi_norm" in grp else np.linspace(0, 1, 51)
-                    q = grp["q"][:] if "q" in grp else None
-                    return psi, q
-
-        try:
-            result = await asyncio.to_thread(_read_vmec, fs, path)
-        except Exception as e:
-            logger.warning("LHD equilibrium unavailable for %s: %s", shot_id, e)
-            return None
-
-        if result is None:
-            return None
-
-        psi, q = result
-        return EquilibriumData(
-            shot_id=self.make_shot_id(native_id),
-            reconstruction_code="VMEC",
-            time_s=[0.0],  # VMEC is typically a single-time reconstruction
-            psi_norm=psi.tolist(),
-            q_profile=q.tolist() if q is not None else None,
-            metadata={"license": _LICENSE},
-        )
+        # LHD VMEC equilibria are not yet available in this bucket
+        return None
 
     # ------------------------------------------------------------------ #
     # Lifecycle                                                            #
@@ -383,13 +396,100 @@ class LHDConnector(AbstractConnector):
 
     async def health_check(self) -> bool:
         try:
-            fs = self._get_fs()
-            result = await asyncio.to_thread(fs.ls, f"s3://{_BUCKET}/", detail=False)
-            return len(result) > 0
+            campaigns = await self._get_campaigns()
+            return len(campaigns) > 0
         except Exception as e:
             logger.warning("LHD health check failed: %s", e)
             return False
 
     async def close(self) -> None:
         self._fs = None
+        self._campaigns = None
         logger.info("LHD S3 filesystem released")
+
+
+# ------------------------------------------------------------------ #
+# Labcom zip parser                                                    #
+# ------------------------------------------------------------------ #
+
+def _parse_prm(z: zipfile.ZipFile, ch: int, prefix: str) -> dict:
+    """Parse a .prm file and return key→value dict."""
+    prm_name = f"{prefix}/{prefix}-{ch}.prm"
+    # Try alternative naming
+    candidates = [n for n in z.namelist() if n.endswith(f"-{ch}.prm")]
+    if not candidates:
+        return {}
+    raw = z.read(candidates[0]).decode("utf-8", errors="replace")
+    result = {}
+    for line in raw.splitlines():
+        parts = line.strip().split(",")
+        if len(parts) >= 3:
+            result[parts[1]] = parts[2]
+    return result
+
+
+def _parse_channel(z: zipfile.ZipFile, ch: int) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Extract (time_arr, data_arr) for channel `ch` from a Labcom zip.
+
+    The .dat file contains raw INT16 data, optionally ZLIB-compressed.
+    Time axis is reconstructed from the sampling rate in the .prm file.
+    """
+    # Find the prefix (e.g. "Bolometer-948609-1")
+    shot_files = [n for n in z.namelist() if n.endswith(".shot")]
+    if not shot_files:
+        raise ValueError("No .shot file in archive")
+    prefix = shot_files[0].replace(".shot", "")
+
+    prm = _parse_prm(z, ch, prefix)
+
+    # Locate the .dat file
+    dat_candidates = [n for n in z.namelist() if n.endswith(f"-{ch}.dat")]
+    if not dat_candidates:
+        raise KeyError(f"Channel {ch} .dat not found in archive")
+    dat_raw = z.read(dat_candidates[0])
+
+    # Decompress if needed
+    comp_method = prm.get("CompressionMethod", "").upper()
+    if "ZLIB" in comp_method and dat_raw:
+        try:
+            dat_raw = zlib.decompress(dat_raw)
+        except zlib.error:
+            pass  # may already be uncompressed
+
+    if not dat_raw:
+        raise ValueError(f"Channel {ch} .dat is empty")
+
+    # Decode as INT16 (little-endian)
+    data_arr = np.frombuffer(dat_raw, dtype="<i2").astype(float)
+
+    # For offset-binary encoding, shift to signed
+    coding = prm.get("BinaryCoding", "").lower()
+    bits_str = prm.get("Resolution(bit)", "16")
+    try:
+        bits = int(bits_str)
+    except ValueError:
+        bits = 16
+    if "offset" in coding:
+        data_arr -= 2 ** (bits - 1)
+
+    # Build time axis
+    sample_rate = _get_sample_rate(prm)
+    n = len(data_arr)
+    time_arr = np.arange(n, dtype=float) / sample_rate
+
+    return time_arr, data_arr
+
+
+def _get_sample_rate(prm: dict) -> float:
+    """Extract sample rate (Hz) from .prm metadata."""
+    for key in ("SamplingTimebase", "ClockSpeed", "IntClockSpeed"):
+        val = prm.get(key)
+        if val:
+            try:
+                rate = float(val)
+                skip = int(prm.get("SkipSize", 1))
+                return rate / max(skip, 1)
+            except (ValueError, ZeroDivisionError):
+                continue
+    return 1_000_000.0  # default: 1 MHz
