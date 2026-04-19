@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from abc import ABC, abstractmethod
+from pathlib import Path
 
+import numpy as np
+
+from ..config import config
 from ..models import (
     DeviceInfo,
     DiagnosticList,
@@ -82,6 +87,58 @@ class AbstractConnector(ABC):
         """
         Return MHD equilibrium reconstruction data, or None if unavailable.
         """
+
+    async def download_signal(
+        self,
+        shot_id: str,
+        diagnostic: str,
+        *,
+        output_dir: Path | None = None,
+        fmt: str = "npz",
+    ) -> dict:
+        """
+        Download a full-resolution signal to a local file and return metadata.
+
+        Fetches the complete time series (no downsampling) and writes it to
+        `output_dir` (default: ~/.cache/fusion-data/). Returns the file path
+        and basic metadata — no data arrays in the response.
+        """
+        signal = await self.get_signal(shot_id, diagnostic, max_samples=10_000_000)
+
+        safe_name = f"{shot_id.replace(':', '_')}_{diagnostic}.{fmt}"
+        dest_dir = output_dir or config.download_dir
+        path = dest_dir / safe_name
+
+        def _write() -> None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            time_arr = np.array(signal.time_s)
+            data_arr = np.array(signal.data)
+            if fmt == "npz":
+                np.savez(path, time_s=time_arr, data=data_arr)
+            elif fmt == "csv":
+                import csv
+                with open(path, "w", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["time_s", "data"])
+                    for t, d in zip(time_arr.tolist(), data_arr.tolist()):
+                        writer.writerow([t, d])
+
+        await asyncio.to_thread(_write)
+
+        n_samples = signal.original_n_samples or len(signal.time_s)
+        duration = signal.time_s[-1] - signal.time_s[0] if signal.time_s else 0.0
+
+        return {
+            "path": str(path),
+            "shot_id": shot_id,
+            "diagnostic": diagnostic,
+            "native_name": signal.native_name,
+            "units": signal.units,
+            "format": fmt,
+            "n_samples": n_samples,
+            "duration_s": round(duration, 6),
+            "file_size_mb": round(path.stat().st_size / 1e6, 3),
+        }
 
     # ------------------------------------------------------------------ #
     # Lifecycle                                                            #

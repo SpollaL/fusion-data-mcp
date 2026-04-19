@@ -44,3 +44,4 @@ class SignalSummary(BaseModel):
     std: float | None = None
     has_gaps: bool = False
     n_null_samples: int = 0
+    sparkline: str | None = None

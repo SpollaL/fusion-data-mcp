@@ -220,6 +220,40 @@ async def list_tools() -> list[types.Tool]:
             },
         ),
         types.Tool(
+            name="download_signal",
+            description=(
+                "Download a full-resolution signal to a local file (NPZ by default). "
+                "Returns the file path and metadata — no data arrays in the response. "
+                "Use this instead of get_signal when you need the complete time series "
+                "for Python/matplotlib analysis. "
+                "Load the result with: data = np.load(path); time = data['time_s']; values = data['data']"
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "shot_id": {
+                        "type": "string",
+                        "description": "Canonical shot ID: '{device}:{native_id}'",
+                    },
+                    "diagnostic": {
+                        "type": "string",
+                        "description": "Canonical or native diagnostic name",
+                    },
+                    "output_dir": {
+                        "type": "string",
+                        "description": "Directory to save the file (default: ~/.cache/fusion-data/)",
+                    },
+                    "format": {
+                        "type": "string",
+                        "enum": ["npz", "csv"],
+                        "default": "npz",
+                        "description": "Output file format",
+                    },
+                },
+                "required": ["shot_id", "diagnostic"],
+            },
+        ),
+        types.Tool(
             name="get_equilibrium",
             description=(
                 "Retrieve MHD equilibrium reconstruction data for a plasma shot. "
@@ -276,6 +310,8 @@ async def _dispatch(name: str, args: dict[str, Any]) -> dict:
         return await _get_signal(args)
     if name == "get_equilibrium":
         return await _get_equilibrium(args)
+    if name == "download_signal":
+        return await _download_signal(args)
     return error_response(ErrorCode.INTERNAL, f"Unknown tool: {name}")
 
 
@@ -346,6 +382,16 @@ async def _get_signal(args: dict) -> dict:
         max_samples=args.get("max_samples", config.default_max_samples),
     )
     return signal.model_dump(mode="json")
+
+
+async def _download_signal(args: dict) -> dict:
+    from pathlib import Path
+    shot_id = args["shot_id"]
+    diagnostic = args["diagnostic"]
+    output_dir = Path(args["output_dir"]) if "output_dir" in args else None
+    fmt = args.get("format", "npz")
+    connector = registry.get_for_shot(shot_id)
+    return await connector.download_signal(shot_id, diagnostic, output_dir=output_dir, fmt=fmt)
 
 
 async def _get_equilibrium(args: dict) -> dict:

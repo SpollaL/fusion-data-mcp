@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Literal
 
 
@@ -20,6 +21,9 @@ class Config:
     enable_cmod: bool = os.getenv("ENABLE_CMOD", "true").lower() == "true"
     enable_mast: bool = os.getenv("ENABLE_MAST", "true").lower() == "true"
     enable_lhd: bool = os.getenv("ENABLE_LHD", "true").lower() == "true"
+
+    # Directory for download_signal output files
+    download_dir: Path = Path(os.getenv("FUSION_DOWNLOAD_DIR", Path.home() / ".cache" / "fusion-data"))
 
 
 config = Config()

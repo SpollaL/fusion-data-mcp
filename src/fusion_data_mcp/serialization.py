@@ -78,6 +78,51 @@ def _has_gaps(time_arr: Any, rtol: float = 0.1) -> bool:
     return bool(np.any(dt > (1 + rtol) * median_dt))
 
 
+_SPARKS = "▁▂▃▄▅▆▇█"
+
+
+def generate_sparkline(data_arr: np.ndarray, width: int = 40) -> str:
+    """
+    Generate an ASCII sparkline from a 1-D numpy array.
+
+    Buckets the data into `width` equal windows, takes the mean of each
+    (ignoring NaN/Inf), and maps to Unicode block characters ▁–█.
+    Returns an empty string if the data is all-NaN or has fewer than 2 values.
+    """
+    arr = np.asarray(data_arr, dtype=float).ravel()
+    finite = arr[np.isfinite(arr)]
+    if len(finite) < 2:
+        return ""
+
+    # Bucket into `width` windows
+    bucket_means = []
+    indices = np.array_split(np.arange(len(arr)), width)
+    for idx in indices:
+        chunk = arr[idx]
+        f = chunk[np.isfinite(chunk)]
+        bucket_means.append(float(np.mean(f)) if len(f) > 0 else float("nan"))
+
+    bucket_means = np.array(bucket_means)
+    finite_means = bucket_means[np.isfinite(bucket_means)]
+    if len(finite_means) == 0:
+        return ""
+
+    lo, hi = finite_means.min(), finite_means.max()
+    if hi == lo:
+        # Flat signal — use mid-level character
+        return _SPARKS[3] * width
+
+    chars = []
+    for v in bucket_means:
+        if not math.isfinite(v):
+            chars.append(" ")
+        else:
+            level = int((v - lo) / (hi - lo) * (len(_SPARKS) - 1))
+            chars.append(_SPARKS[level])
+
+    return "".join(chars)
+
+
 def downsample(time_arr: np.ndarray, data_arr: np.ndarray, max_samples: int) -> tuple[np.ndarray, np.ndarray]:
     """Uniform stride downsampling. Preserves first and last sample."""
     n = len(time_arr)
@@ -192,4 +237,5 @@ def summary_from_arrays(
         std=float(np.std(finite_data)) if finite_data is not None and len(finite_data) > 0 else None,
         has_gaps=_has_gaps(time_arr),
         n_null_samples=n_nulls,
+        sparkline=generate_sparkline(data_arr) if data_arr.ndim == 1 else None,
     )
